@@ -1880,7 +1880,8 @@ static bool EvaluateAtomic(const Expr *E, const LValue *This, APValue &Result,
                            EvalInfo &Info);
 static bool EvaluateAsRValue(EvalInfo &Info, const Expr *E, APValue &Result);
 static bool EvaluateBuiltinStrLen(const Expr *E, uint64_t &Result,
-                                  EvalInfo &Info);
+                                  EvalInfo &Info,
+                                  std::string *StringResult = nullptr);
 
 /// Evaluate an integer or fixed point expression into an APResult.
 static bool EvaluateFixedPointOrInteger(const Expr *E, APFixedPoint &Result,
@@ -12443,6 +12444,54 @@ bool IntExprEvaluator::VisitBuiltinCallExpr(const CallExpr *E,
            Success((Val.classify() & Test) ? 1 : 0, E);
   }
 
+  case Builtin::BI__builtin_signbit:
+  case Builtin::BI__builtin_signbitf:
+  case Builtin::BI__builtin_signbitl: {
+    APFloat Val(0.0);
+    return EvaluateFloat(E->getArg(0), Val, Info) &&
+           Success(Val.isNegative() ? 1 : 0, E);
+  }
+
+  case Builtin::BI__builtin_isgreater:
+  case Builtin::BI__builtin_isgreaterequal:
+  case Builtin::BI__builtin_isless:
+  case Builtin::BI__builtin_islessequal:
+  case Builtin::BI__builtin_islessgreater:
+  case Builtin::BI__builtin_isunordered: {
+    APFloat LHS(0.0);
+    APFloat RHS(0.0);
+    if (!EvaluateFloat(E->getArg(0), LHS, Info) ||
+        !EvaluateFloat(E->getArg(1), RHS, Info))
+      return false;
+
+    return Success(
+        [&] {
+          switch (BuiltinOp) {
+          case Builtin::BI__builtin_isgreater:
+            return LHS > RHS;
+          case Builtin::BI__builtin_isgreaterequal:
+            return LHS >= RHS;
+          case Builtin::BI__builtin_isless:
+            return LHS < RHS;
+          case Builtin::BI__builtin_islessequal:
+            return LHS <= RHS;
+          case Builtin::BI__builtin_islessgreater: {
+            APFloat::cmpResult cmp = LHS.compare(RHS);
+            return cmp == APFloat::cmpResult::cmpLessThan ||
+                   cmp == APFloat::cmpResult::cmpGreaterThan;
+          }
+          case Builtin::BI__builtin_isunordered:
+            return LHS.compare(RHS) == APFloat::cmpResult::cmpUnordered;
+          default:
+            llvm_unreachable("Unexpected builtin ID: Should be a floating "
+                             "point comparison function");
+          }
+        }()
+            ? 1
+            : 0,
+        E);
+  }
+
   case Builtin::BI__builtin_parity:
   case Builtin::BI__builtin_parityl:
   case Builtin::BI__builtin_parityll: {
@@ -16600,7 +16649,8 @@ bool Expr::tryEvaluateObjectSize(uint64_t &Result, ASTContext &Ctx,
 }
 
 static bool EvaluateBuiltinStrLen(const Expr *E, uint64_t &Result,
-                                  EvalInfo &Info) {
+                                  EvalInfo &Info,
+                                  std::string *StringResult) {
   if (!E->getType()->hasPointerRepresentation() || !E->isPRValue())
     return false;
 
@@ -16626,6 +16676,8 @@ static bool EvaluateBuiltinStrLen(const Expr *E, uint64_t &Result,
       if (Pos != StringRef::npos)
         Str = Str.substr(0, Pos);
 
+      if (StringResult)
+        *StringResult = Str;
       Result = Str.size();
       return true;
     }
@@ -16643,6 +16695,8 @@ static bool EvaluateBuiltinStrLen(const Expr *E, uint64_t &Result,
       Result = Strlen;
       return true;
     }
+    if (StringResult)
+      StringResult->push_back(static_cast<char>(Char.getInt().getExtValue()));
     if (!HandleLValueArrayAdjustment(Info, E, String, CharTy, 1))
       return false;
   }
@@ -16691,4 +16745,15 @@ bool Expr::tryEvaluateStrLen(uint64_t &Result, ASTContext &Ctx) const {
   Expr::EvalStatus Status;
   EvalInfo Info(Ctx, Status, EvalInfo::EM_ConstantFold);
   return EvaluateBuiltinStrLen(this, Result, Info);
+}
+
+std::optional<std::string> Expr::tryEvaluateString(ASTContext &Ctx) const {
+  Expr::EvalStatus Status;
+  EvalInfo Info(Ctx, Status, EvalInfo::EM_ConstantFold);
+  uint64_t StrLen;
+  std::string StringResult;
+
+  if (EvaluateBuiltinStrLen(this, StrLen, Info, &StringResult))
+    return StringResult;
+  return std::nullopt;
 }
